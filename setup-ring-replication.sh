@@ -57,20 +57,25 @@ declare -a RING_SOURCE=("$NODE5_IP" "$NODE1_IP" "$NODE2_IP" "$NODE3_IP" "$NODE4_
 # PC4 replica de PC3
 # PC5 replica de PC4
 
-PORT="$MYSQL_PORT"
+# Puertos por nodo: NODE3 y NODE4 usan 3307, el resto usa MYSQL_PORT
+declare -a NODO_PORTS=("$MYSQL_PORT" "$MYSQL_PORT" "3307" "3307" "$MYSQL_PORT")
+# Puertos del source (nodo anterior en el anillo) para cada réplica
+declare -a RING_SOURCE_PORTS=("$MYSQL_PORT" "$MYSQL_PORT" "$MYSQL_PORT" "3307" "3307")
 
 # --- Función: ejecutar MySQL en un nodo remoto ---
 exec_mysql() {
     local host="$1"
-    local sql="$2"
-    mysql -h "$host" -P "$PORT" -u"$ADMIN_USER" -p"$ADMIN_PASSWORD" -e "$sql" 2>/dev/null
+    local port="$2"
+    local sql="$3"
+    mysql -h "$host" -P "$port" -u"$ADMIN_USER" -p"$ADMIN_PASSWORD" -e "$sql" 2>/dev/null
 }
 
 # --- Función: ejecutar MySQL y capturar salida ---
 exec_mysql_raw() {
     local host="$1"
-    local sql="$2"
-    mysql -h "$host" -P "$PORT" -u"$ADMIN_USER" -p"$ADMIN_PASSWORD" -N -e "$sql" 2>/dev/null
+    local port="$2"
+    local sql="$3"
+    mysql -h "$host" -P "$port" -u"$ADMIN_USER" -p"$ADMIN_PASSWORD" -N -e "$sql" 2>/dev/null
 }
 
 # ============================================================
@@ -87,11 +92,12 @@ echo -e "${YELLOW}📡 Fase 1: Verificando conectividad a los 5 nodos...${NC}"
 for i in {0..4}; do
     NODE_NUM=$((i + 1))
     IP="${NODO_IPS[$i]}"
-    echo -n "   Nodo $NODE_NUM ($IP)... "
+    N_PORT="${NODO_PORTS[$i]}"
+    echo -n "   Nodo $NODE_NUM ($IP:$N_PORT)... "
 
     RETRIES=0
     MAX_RETRIES=30
-    until mysqladmin ping -h "$IP" -P "$PORT" -u"$ADMIN_USER" -p"$ADMIN_PASSWORD" --silent 2>/dev/null; do
+    until mysqladmin ping -h "$IP" -P "$N_PORT" -u"$ADMIN_USER" -p"$ADMIN_PASSWORD" --silent 2>/dev/null; do
         RETRIES=$((RETRIES + 1))
         if [ $RETRIES -ge $MAX_RETRIES ]; then
             echo -e "${RED}❌ TIMEOUT después de ${MAX_RETRIES} intentos${NC}"
@@ -112,7 +118,7 @@ echo -e "${YELLOW}🗄️  Fase 2: Verificando que ring_db exista en Nodo 1...${
 
 RETRIES=0
 MAX_RETRIES=20
-until exec_mysql_raw "${NODO_IPS[0]}" "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='ring_db';" | grep -q "ring_db"; do
+until exec_mysql_raw "${NODO_IPS[0]}" "${NODO_PORTS[0]}" "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='ring_db';" | grep -q "ring_db"; do
     RETRIES=$((RETRIES + 1))
     if [ $RETRIES -ge $MAX_RETRIES ]; then
         echo -e "${RED}❌ La base de datos ring_db no existe en Nodo 1.${NC}"
@@ -132,8 +138,9 @@ echo -e "${YELLOW}🛑 Fase 3: Deteniendo replicación existente en todos los no
 for i in {0..4}; do
     NODE_NUM=$((i + 1))
     IP="${NODO_IPS[$i]}"
+    N_PORT="${NODO_PORTS[$i]}"
     echo -n "   Nodo $NODE_NUM... "
-    exec_mysql "$IP" "STOP REPLICA; RESET REPLICA ALL;" 2>/dev/null || true
+    exec_mysql "$IP" "$N_PORT" "STOP REPLICA; RESET REPLICA ALL;" 2>/dev/null || true
     echo -e "${GREEN}✅ Limpio${NC}"
 done
 
@@ -148,15 +155,17 @@ echo ""
 for i in {0..4}; do
     NODE_NUM=$((i + 1))
     REPLICA_IP="${NODO_IPS[$i]}"
+    REPLICA_PORT="${NODO_PORTS[$i]}"
     SOURCE_IP="${RING_SOURCE[$i]}"
+    SOURCE_PORT="${RING_SOURCE_PORTS[$i]}"
     SOURCE_NUM=$(( (i + 4) % 5 + 1 ))  # Nodo anterior en el anillo
 
-    echo -e "   ${CYAN}Nodo $NODE_NUM ($REPLICA_IP) ← replica de ← Nodo $SOURCE_NUM ($SOURCE_IP)${NC}"
+    echo -e "   ${CYAN}Nodo $NODE_NUM ($REPLICA_IP:$REPLICA_PORT) ← replica de ← Nodo $SOURCE_NUM ($SOURCE_IP:$SOURCE_PORT)${NC}"
 
-    exec_mysql "$REPLICA_IP" "
+    exec_mysql "$REPLICA_IP" "$REPLICA_PORT" "
         CHANGE REPLICATION SOURCE TO
             SOURCE_HOST='${SOURCE_IP}',
-            SOURCE_PORT=${PORT},
+            SOURCE_PORT=${SOURCE_PORT},
             SOURCE_USER='${REPL_USER}',
             SOURCE_PASSWORD='${REPL_PASSWORD}',
             SOURCE_AUTO_POSITION=1,
@@ -181,8 +190,9 @@ echo -e "${YELLOW}▶️  Fase 5: Iniciando replicación en todos los nodos...${
 for i in {0..4}; do
     NODE_NUM=$((i + 1))
     IP="${NODO_IPS[$i]}"
+    N_PORT="${NODO_PORTS[$i]}"
     echo -n "   Nodo $NODE_NUM... "
-    exec_mysql "$IP" "START REPLICA;"
+    exec_mysql "$IP" "$N_PORT" "START REPLICA;"
     echo -e "${GREEN}✅ Replicación iniciada${NC}"
 done
 
@@ -204,11 +214,12 @@ ALL_OK=true
 for i in {0..4}; do
     NODE_NUM=$((i + 1))
     IP="${NODO_IPS[$i]}"
+    N_PORT="${NODO_PORTS[$i]}"
     SOURCE_NUM=$(( (i + 4) % 5 + 1 ))
 
-    echo -e "${CYAN}--- Nodo $NODE_NUM ($IP) — replica de Nodo $SOURCE_NUM ---${NC}"
+    echo -e "${CYAN}--- Nodo $NODE_NUM ($IP:$N_PORT) — replica de Nodo $SOURCE_NUM ---${NC}"
 
-    STATUS=$(exec_mysql_raw "$IP" "SHOW REPLICA STATUS\G" 2>/dev/null)
+    STATUS=$(exec_mysql_raw "$IP" "$N_PORT" "SHOW REPLICA STATUS\G" 2>/dev/null)
 
     IO_RUNNING=$(echo "$STATUS" | grep "Replica_IO_Running:" | awk '{print $2}')
     SQL_RUNNING=$(echo "$STATUS" | grep "Replica_SQL_Running:" | awk '{print $2}' | head -1)
@@ -252,7 +263,7 @@ echo ""
 # Insertar un registro de prueba en Nodo 1
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 echo -e "   Insertando registro de prueba en Nodo 1..."
-exec_mysql "${NODO_IPS[0]}" "
+exec_mysql "${NODO_IPS[0]}" "${NODO_PORTS[0]}" "
     INSERT INTO ring_db.test_ring (nodo_origen, mensaje)
     VALUES ('PC1', 'Test de anillo — ${TIMESTAMP}');
 "
@@ -266,9 +277,10 @@ echo ""
 for i in {0..4}; do
     NODE_NUM=$((i + 1))
     IP="${NODO_IPS[$i]}"
-    echo -n "   Nodo $NODE_NUM ($IP): "
+    N_PORT="${NODO_PORTS[$i]}"
+    echo -n "   Nodo $NODE_NUM ($IP:$N_PORT): "
 
-    RESULT=$(exec_mysql_raw "$IP" "SELECT COUNT(*) FROM ring_db.test_ring WHERE mensaje LIKE 'Test de anillo%' AND nodo_origen='PC1';" 2>/dev/null)
+    RESULT=$(exec_mysql_raw "$IP" "$N_PORT" "SELECT COUNT(*) FROM ring_db.test_ring WHERE mensaje LIKE 'Test de anillo%' AND nodo_origen='PC1';" 2>/dev/null)
 
     if [ -n "$RESULT" ] && [ "$RESULT" -gt 0 ] 2>/dev/null; then
         echo -e "${GREEN}✅ Registro encontrado ($RESULT coincidencias)${NC}"
@@ -295,11 +307,11 @@ else
     echo -e "${YELLOW}  Revisa los errores anteriores y verifica:${NC}"
     echo -e "${YELLOW}    1. Que los 5 contenedores estén corriendo${NC}"
     echo -e "${YELLOW}    2. Que las IPs en .env sean correctas${NC}"
-    echo -e "${YELLOW}    3. Que el firewall permita puerto ${PORT}${NC}"
+    echo -e "${YELLOW}    3. Que el firewall permita puertos ${MYSQL_PORT} y 3307${NC}"
     echo -e "${YELLOW}    4. Ejecuta en cada nodo: SHOW REPLICA STATUS\\G${NC}"
 fi
 echo -e "${CYAN}============================================================${NC}"
 echo ""
-echo -e "Comandos útiles para monitoreo:"
-echo -e "  ${CYAN}mysql -h <IP> -P $PORT -u$ADMIN_USER -p$ADMIN_PASSWORD -e 'SHOW REPLICA STATUS\\G'${NC}"
-echo -e "  ${CYAN}mysql -h <IP> -P $PORT -u$ADMIN_USER -p$ADMIN_PASSWORD -e 'SELECT * FROM ring_db.test_ring;'${NC}"
+echo -e "Comandos útiles para monitoreo (usar puerto 3307 para PC3/PC4):"
+echo -e "  ${CYAN}mysql -h <IP> -P <PUERTO> -u$ADMIN_USER -p$ADMIN_PASSWORD -e 'SHOW REPLICA STATUS\\G'${NC}"
+echo -e "  ${CYAN}mysql -h <IP> -P <PUERTO> -u$ADMIN_USER -p$ADMIN_PASSWORD -e 'SELECT * FROM ring_db.test_ring;'${NC}"
